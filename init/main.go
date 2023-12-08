@@ -9,7 +9,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -21,7 +20,8 @@ import (
 )
 
 const (
-	newRoot = "/booster.root"
+	newRoot     = "/new-root"
+	persistDisk = "/persistent"
 )
 
 var (
@@ -375,7 +375,46 @@ func fsck(dev string) error {
 	return nil
 }
 
+func copyFile(src string, dest string) error {
+	srcFile, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer srcFile.Close()
+
+	destFile, err := os.OpenFile(dest, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o755)
+	if err != nil {
+		return err
+	}
+	defer destFile.Close()
+
+	_, err = io.Copy(destFile, srcFile)
+	return err
+}
+
 func mountRootFs(dev, fstype string) error {
+	info("mounting tmpfs as %s", newRoot)
+
+	if err := mount("hive-root", newRoot, "tmpfs", 0, "mode=0755,size=50%"); err != nil {
+		return err
+	}
+
+	if err := os.Mkdir(newRoot+"/bin", 0o755); err != nil {
+		return err
+	}
+
+	if err := os.Mkdir(newRoot+"/sbin", 0o755); err != nil {
+		return err
+	}
+
+	if err := copyFile("/usr/bin/busybox", newRoot+"/bin/busybox"); err != nil {
+		return err
+	}
+
+	if err := os.Symlink("/bin/busybox", newRoot+"/bin/sh"); err != nil {
+		return err
+	}
+
 	// some fs have module names that differs from the fs name itself
 	fstypeModules := map[string]string{
 		"iso9660": "isofs",
@@ -405,8 +444,9 @@ func mountRootFs(dev, fstype string) error {
 	}
 
 	rootMountFlags, options := mountFlags()
-	info("mounting %s->%s, fs=%s, flags=0x%x, options=%s", dev, newRoot, fstype, rootMountFlags, options)
-	if err := mount(dev, newRoot, fstype, rootMountFlags, options); err != nil {
+	info("mounting %s->%s, fs=%s, flags=0x%x, options=%s", dev, persistDisk, fstype, rootMountFlags, options)
+
+	if err := mount(dev, persistDisk, fstype, rootMountFlags, options); err != nil {
 		// Note that this mounting function might be called multiple times
 		// e.g. in case of multiple devices needed to assemble the root array, see https://github.com/anatol/booster/issues/194
 		// It will try to mount it until mount() is successful.
@@ -525,18 +565,9 @@ func isSystemd(path string) (bool, error) {
 //   - /run might contain some udev state that needs to be passed from initramfs to host
 //   - runit expects that /dev/ is mounted at the moment runit starts
 func moveMountpointsToHost() error {
-	for _, m := range []string{"/run", "/dev", "/proc", "/sys"} {
-		// remount root as it might contain state that we need to pass to the new root
-		_, err := os.Stat(newRoot + m)
-		if os.IsNotExist(err) {
-			// let's print a warning and hope that host OS setup the filesystem if needed
-			warning("%s does not exist at the newly mounted root filesystem", m)
-
-			// unmount the directory so its directory can be removed and reclaimed
-			if err := unix.Unmount(m, unix.MNT_DETACH); err != nil {
-				return fmt.Errorf("unmount(%s): %v", m, err)
-			}
-			continue
+	for _, m := range []string{persistDisk, "/run", "/dev", "/proc", "/sys"} {
+		if err := os.Mkdir(newRoot+m, 0o755); err != nil {
+			return fmt.Errorf("failed to create mountpoint %v at new root: %w", m, err)
 		}
 
 		if err := unix.Mount(m, newRoot+m, "", unix.MS_MOVE, ""); err != nil {
@@ -661,38 +692,45 @@ func switchRoot() error {
 		return fmt.Errorf("chdir: %v", err)
 	}
 
-	if _, err := os.Stat(initBinary); os.IsNotExist(err) {
-		return fmt.Errorf("init binary %s does not exist in the user's chroot", initBinary)
-	}
+	transientDirs := []string{"etc", "lib", "tmp"}
 
-	initArgs := []string{initBinary}
-	isSystemdInit, err := isSystemd(initBinary)
-	if err != nil {
-		return err
-	}
-	if isSystemdInit {
-		// pass serialized state to userspace, this way we can export for example initrd execution time
-		fd, err := unix.MemfdCreate("systemd-state", 0)
-		if err != nil {
-			return fmt.Errorf("memfd create: %v", err)
-		}
-		state := fmt.Sprintf("initrd-timestamp=%d %d\n", startRealtime, startMonotonic)
-		if _, err := unix.Write(fd, []byte(state)); err != nil {
-			return err
-		}
-		if _, err := unix.Seek(fd, 0, io.SeekStart); err != nil {
-			return err
+	for _, dir := range []string{"home", "media", "nix", "root", "var"} {
+		src := filepath.Join(persistDisk, dir)
+
+		if _, err := os.Stat(src); os.IsNotExist(err) {
+			transientDirs = append(transientDirs, dir)
+			continue
 		}
 
-		initArgs = append(initArgs, "--switched-root", "--system", "--deserialize", strconv.Itoa(fd))
+		if err := mount(src, filepath.Join("/", dir), "", unix.MS_BIND, ""); err != nil {
+			return fmt.Errorf("bind mount %v: %w", dir, err)
+		}
 	}
 
-	// Run the OS init
-	info("Switching to the new userspace now. Да пабачэння!")
-	if err := unix.Exec(initBinary, initArgs, nil); err != nil {
-		return fmt.Errorf("Can't run the rootfs init (%v): %v", initBinary, err)
+	for _, dir := range transientDirs {
+		if err := os.Mkdir(filepath.Join("/", dir), 0o755); err != nil {
+			return fmt.Errorf("mkdir: %v: %w", dir, err)
+		}
 	}
-	return nil // unreachable
+
+	if err := os.Chmod("/tmp", 0o777); err != nil {
+		return fmt.Errorf("chmod /tmp: %w", err)
+	}
+
+	cmd := exec.Command(
+		"/nix/var/nix/profiles/system/codex-active/usr/bin/codex",
+		"activate",
+		"--confirm",
+		"--quiet",
+	)
+
+	if err := cmd.Run(); err != nil {
+		warning("failed to activate system profile: %v", err.Error())
+		return unix.Exec("/bin/sh", []string{"/bin/sh"}, nil)
+	}
+
+	info("exec into /sbin/init")
+	return unix.Exec(initBinary, []string{initBinary}, nil)
 }
 
 // Cleanup the state before handing off the machine to the new init
@@ -818,11 +856,6 @@ func boost() error {
 	}
 
 	if err := readAliases(); err != nil {
-		return err
-	}
-
-	// Per systemd convention https://systemd.io/INITRD_INTERFACE/
-	if err := os.Mkdir("/run/initramfs", 0o755); err != nil {
 		return err
 	}
 
@@ -1025,9 +1058,7 @@ func main() {
 			printMissingModules()
 		}
 	}
-	emergencyShell()
 
-	// if we are here then emergency shell did not launch
-	// in this case suggest user to reboot the computer
+	emergencyShell()
 	reboot()
 }
